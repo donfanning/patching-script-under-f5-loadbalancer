@@ -8,6 +8,7 @@ require 'open3'
 require 'trollop'
 require 'pp'
 require 'f5-icontrol'
+require 'resolv'
 
 Ridley::Logging.logger.level = Logger.const_get 'ERROR'
 ridley = Ridley.from_chef_config('/home/user/.chef/knife.rb')
@@ -33,37 +34,38 @@ end
 date = (Date.today-1).strftime("%Y%m%d").to_s
 
 opts = Trollop::options do
-	opt :u, "user", :type => :string
+	opt :u, "DOMAIN user", :type => :string
 	opt :k, "Patch Kernel"
 	opt :r, "Reboot after patching"
+	opt :c, "Disable Chef Checking"
+	opt :cmd, "Patch Command - default is wdig patch script", :type => :string
 	opt :search, "Chef parameters to search for targets", :type => :string
 end
 
 f5user = opts[:u]
-user = "#{f5user}@domain"
+user = "#{f5user}@DOMAIN"
 pass = ask("Enter your DOMAIN password: ") { |q| q.echo = "*" }
 ridley_search = opts[:search].to_s
 patch_date = date
-kernel_patch = opts[:k]
-reboot_server = opts[:r]
+chef_check = opts[:c]
+patch_cmd = opts[:cmd].to_s
 
-if kernel_patch == true
-	kflg = "-k"
-else 
-	kflg = ""
-end
-
-if reboot_server == true
-	rflg = "-r"
+if patch_cmd == ""
+	cmdline = "yum -y update"
 else
-	rflg = ""
+	cmdline = patch_cmd
 end
 
-cmdline = "yum -y update"
+if chef_check == false
+	nodes = ridley.search(:node, "#{ridley_search}")
+	nodenames = nodes.map { |node| node.name }
+end
 
-nodes = ridley.search(:node, "#{ridley_search}")
-nodenames = nodes.map { |node| node.name }
-
+if chef_check == true
+	puts "Being run in non-chef mode - use host.domain.tld instead of name:node"
+	search = ridley_search.to_s
+	nodenames = search.try(:split, " ")
+end
 
 ##############
 
@@ -79,9 +81,15 @@ def checkChefIPAddr(nodename)
 	return ipaddr
 end
 
+def getIPAddr(nodename)
+	ipaddr = Resolv.new.getaddress("#{nodename}")
+	#puts ipaddr
+	return ipaddr
+end
+
 def getF5port(ipaddress)
 	ipaddr_s = ipaddress[0].to_s
-	db = SQLite3::Database.new "f5_mobile.sqlite3"
+	db = SQLite3::Database.new "f5_partition.sqlite3"
 	row = db.execute("SELECT ipport from members where ipaddr = '#{ipaddr_s}'")
 	return row
 	db.close
@@ -89,7 +97,7 @@ end
 
 def getF5pool(ipaddress)
 	ipaddr_s = ipaddress[0].to_s
-	db = SQLite3::Database.new "f5_mobile.sqlite3"
+	db = SQLite3::Database.new "f5_partition.sqlite3"
     row = db.execute("SELECT bigipaddr,pool,ipport FROM members WHERE ipaddr = '#{ipaddr_s}'")
 	return row
 	db.close
@@ -97,7 +105,7 @@ end
 
 def getF5lb(pool)
 	pool_s = pool.to_s
-    db = SQLite3::Database.new "f5_mobile.sqlite3"
+    db = SQLite3::Database.new "f5_partition.sqlite3"
     row = db.get_first_value("SELECT bigipaddr from members where pool = '#{pool_s}'")
     return row
   	db.close
@@ -107,13 +115,13 @@ def disableF5member(host,pool,member,port,f5user,pass)
 	#puts "disablef5: #{pool}:#{member}:#{port}"
 	targetmember = member.to_s
 	targetport = port.to_s
-	db = SQLite3::Database.new "f5_mobile.sqlite3"
+	db = SQLite3::Database.new "f5_partition.sqlite3"
 	state = ""
 	db.execute("SELECT state FROM members WHERE pool = '#{pool}' AND ipaddr = '#{member}' AND ipport = '#{port}'") do |row|
 	  state = row.to_s
 	end
 	oddeven = highlowhost(host)
-	bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember"]).get_interfaces
+	bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember", "System.Session"]).get_interfaces
 	failover = bigip["System.Failover"].get_failover_state()
 
     if failover =~ /FAILOVER_STATE_STANDBY/
@@ -127,7 +135,7 @@ def disableF5member(host,pool,member,port,f5user,pass)
             newhost = host.sub(oddhost,evenhost)
             host = newhost
             puts "Switching to Active LTM: #{host}"
-            bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember"]).get_interfaces
+            bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember", "System.Session"]).get_interfaces
             failover = bigip["System.Failover"].get_failover_state()
         end
         if oddeven.even?
@@ -139,13 +147,19 @@ def disableF5member(host,pool,member,port,f5user,pass)
             newhost = host.sub(evenhost,oddhost)
             host = newhost
             puts "Switching to Active LTM: #{host}"
-            bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember"]).get_interfaces
+            bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember", "System.Session"]).get_interfaces
             failover = bigip["System.Failover"].get_failover_state()
         end
     end 
 		
 	if failover =~ /FAILOVER_STATE_ACTIVE/
 		puts "Gathering current state..."
+		partition = "MOBILE"
+		#bigip["System.Session"].set_active_folder(["MOBILE"])
+		#bigip["Management.Partition"].get_partition_list().each do |partition|
+		#	puts partition['partition_name']
+		#end
+		bigip["Management.Partition"].set_active_partition(partition)
 		bigip["LocalLB.PoolMember"].get_session_enabled_state([pool])[0].each do |member|
 			memberaddress = member['member']['address'].to_s
 			memberport = member['member']['port'].to_s
@@ -198,6 +212,8 @@ def enableF5member(host,pool,member,port,f5user,pass)
 	db.execute("SELECT state FROM members WHERE pool = '#{pool}' AND ipaddr = '#{member}' AND ipport = '#{port}'") do |row|
 	  state = row.to_s
 	end
+	
+	if state !=~ /DISABLED/
 	oddeven = highlowhost(host)
 	bigip = F5::IControl.new(host, f5user, pass, ["System.Failover", "Management.Partition", "LocalLB.Pool", "LocalLB.PoolMember"]).get_interfaces
 	failover = bigip["System.Failover"].get_failover_state()
@@ -231,6 +247,8 @@ def enableF5member(host,pool,member,port,f5user,pass)
     end 
 		
 	if failover =~ /FAILOVER_STATE_ACTIVE/
+		partition = "MOBILE"
+		bigip["Management.Partition"].set_active_partition(partition)
 		puts "Gathering current state..."
 		bigip["LocalLB.PoolMember"].get_session_enabled_state([pool])[0].each do |member|
 			memberaddress = member['member']['address'].to_s
@@ -274,6 +292,9 @@ def enableF5member(host,pool,member,port,f5user,pass)
     else
     	puts "Pool Member Enable Failed {dbg:#{$pre_session_enabled_state}::#{$post_session_enabled_state}}".red
     end
+    else
+    	puts "System intentionally disabled from F5.  Skipping."
+    end
 end
 
 def noop
@@ -286,10 +307,17 @@ nodes.each do |nodename|
 		"Username" => "#{user}",
 		"Password" => "#{pass}"
 	)
-	ipaddr = checkChefIPAddr(nodename)
 	
-   	puts "\e[H\e[2J" #clear screen
-	puts "Hostname: #{nodename} - #{ipaddr[0]}".bold.cyan
+	if chef_check == false
+		ipaddr = checkChefIPAddr(nodename)
+	   	puts "\e[H\e[2J" #clear screen
+		puts "Hostname: #{nodename} - #{ipaddr[0]}".bold.cyan
+	else
+		ipaddr = getIPAddr(nodename).to_s
+	   	puts "\e[H\e[2J" #clear screen
+		puts "Hostname: #{nodename} - #{ipaddr}".bold.cyan
+	end
+	
 	puts 
 	puts
 	port = getF5port(ipaddr)
